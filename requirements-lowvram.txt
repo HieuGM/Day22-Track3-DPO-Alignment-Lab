@@ -1,0 +1,18 @@
+# Local 6–8 GB VRAM profile used by COMPUTE_TIER=LOWVRAM.
+#
+# Install CUDA PyTorch separately from the official PyTorch index first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# This profile deliberately avoids Unsloth/bitsandbytes.  Qwen2.5-0.5B fits in
+# fp16, which is substantially easier to reproduce on native Windows.
+transformers>=4.46,<5.0
+trl>=0.12,<0.20
+peft>=0.13,<1.0
+accelerate>=1.1,<2.0
+datasets>=3.1,<4.0
+matplotlib>=3.9,<4.0
+pandas>=2.2,<3.1
+pyarrow>=17,<22
+jupyterlab>=4.3,<5.0
+jupytext>=1.16,<2.0
+pytest>=8.3,<10.0

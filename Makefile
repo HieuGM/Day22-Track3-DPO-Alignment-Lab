@@ -2,11 +2,25 @@
 ## Tier-aware via COMPUTE_TIER (T4 default, BIGGPU optional).
 
 VENV     := .venv
-PY       := $(VENV)/bin/python
-PIP      := $(VENV)/bin/pip
-JUPYTEXT := $(VENV)/bin/jupytext
-PYTEST   := $(VENV)/bin/pytest
-JUPYTER  := $(VENV)/bin/jupyter
+
+# Python virtual environments use different executable layouts on Windows.
+# Keeping this here makes the same Makefile usable from Git Bash/PowerShell and
+# from Linux/Colab.
+ifeq ($(OS),Windows_NT)
+  VENV_BIN := $(VENV)/Scripts
+  PY       := $(VENV_BIN)/python.exe
+  PIP      := $(VENV_BIN)/pip.exe
+  JUPYTEXT := $(VENV_BIN)/jupytext.exe
+  PYTEST   := $(VENV_BIN)/pytest.exe
+  JUPYTER  := $(VENV_BIN)/jupyter.exe
+else
+  VENV_BIN := $(VENV)/bin
+  PY       := $(VENV_BIN)/python
+  PIP      := $(VENV_BIN)/pip
+  JUPYTEXT := $(VENV_BIN)/jupytext
+  PYTEST   := $(VENV_BIN)/pytest
+  JUPYTER  := $(VENV_BIN)/jupyter
+endif
 
 # If running on Colab there's no venv — fall back to system python.
 ifeq ($(wildcard $(PY)),)

@@ -27,13 +27,18 @@ import os
 from pathlib import Path
 
 COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
+assert COMPUTE_TIER in ("LOWVRAM", "T4", "BIGGPU"), f"Invalid COMPUTE_TIER: {COMPUTE_TIER}"
 
-if COMPUTE_TIER == "T4":
-    PREF_SLICE = 1000
+if COMPUTE_TIER == "LOWVRAM":
+    PREF_SLICE = int(os.environ.get("PREF_SLICE", "128"))
+    MAX_LEN = int(os.environ.get("MAX_LEN", "192"))
+    MAX_PROMPT_LEN = int(os.environ.get("MAX_PROMPT_LEN", "96"))
+elif COMPUTE_TIER == "T4":
+    PREF_SLICE = int(os.environ.get("PREF_SLICE", "1000"))
     MAX_LEN = 512
     MAX_PROMPT_LEN = 256
 else:
-    PREF_SLICE = 5000
+    PREF_SLICE = int(os.environ.get("PREF_SLICE", "5000"))
     MAX_LEN = 1024
     MAX_PROMPT_LEN = 512
 
@@ -155,9 +160,10 @@ pref.to_parquet(str(PREF_OUT / "train.parquet"))
 print(f"Saved {len(pref)} pairs to {PREF_OUT / 'train.parquet'}")
 
 # Also save a small eval slice (last 50 pairs) for NB4 use.
-eval_slice = pref.select(range(len(pref) - 50, len(pref)))
+eval_count = min(50, len(pref))
+eval_slice = pref.select(range(len(pref) - eval_count, len(pref)))
 eval_slice.to_parquet(str(PREF_OUT / "eval.parquet"))
-print(f"Saved 50 eval pairs to {PREF_OUT / 'eval.parquet'}")
+print(f"Saved {eval_count} eval pairs to {PREF_OUT / 'eval.parquet'}")
 
 # %% [markdown]
 # ## 5. Vibe-coding callout

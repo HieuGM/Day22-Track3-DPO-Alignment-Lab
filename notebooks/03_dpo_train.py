@@ -21,11 +21,19 @@
 
 # %%
 import os
+import time
 from pathlib import Path
 
 COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
+assert COMPUTE_TIER in ("LOWVRAM", "T4", "BIGGPU"), f"Invalid COMPUTE_TIER: {COMPUTE_TIER}"
 
-if COMPUTE_TIER == "T4":
+if COMPUTE_TIER == "LOWVRAM":
+    BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    MAX_LEN = int(os.environ.get("MAX_LEN", "192"))
+    MAX_PROMPT_LEN = int(os.environ.get("MAX_PROMPT_LEN", "96"))
+    PER_DEVICE_BATCH = 1
+    GRAD_ACCUM = 4
+elif COMPUTE_TIER == "T4":
     BASE_MODEL = "unsloth/Qwen2.5-3B-bnb-4bit"
     MAX_LEN = 512
     MAX_PROMPT_LEN = 256
@@ -40,8 +48,12 @@ else:
 
 # Hyperparameters from deck §5.2 (TRL DPOTrainer implementation frame)
 BETA = float(os.environ.get("DPO_BETA", "0.1"))
-LR = float(os.environ.get("DPO_LR", "5e-7"))
-EPOCHS = int(os.environ.get("DPO_EPOCHS", "1"))
+# A 128-pair, 0.5B run needs a stronger update than the full 1k/5k-pair tiers;
+# the first LOWVRAM baseline at 5e-7 produced a noisy negative final margin.
+default_lr = "5e-6" if COMPUTE_TIER == "LOWVRAM" else "5e-7"
+default_epochs = "2" if COMPUTE_TIER == "LOWVRAM" else "1"
+LR = float(os.environ.get("DPO_LR", default_lr))
+EPOCHS = int(os.environ.get("DPO_EPOCHS", default_epochs))
 
 REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
@@ -65,6 +77,7 @@ print(f"output:          {DPO_OUT}")
 import torch
 
 assert torch.cuda.is_available(), "DPO needs a CUDA GPU. See HARDWARE-GUIDE.md."
+torch.cuda.reset_peak_memory_stats()
 
 # %% [markdown]
 # ## 1. Load policy + reference (the VRAM story)
@@ -76,48 +89,78 @@ assert torch.cuda.is_available(), "DPO needs a CUDA GPU. See HARDWARE-GUIDE.md."
 # sequences, not from a second copy of the weights.
 
 # %%
-from unsloth import FastLanguageModel
-from peft import PeftModel
+from peft import LoraConfig, PeftModel, get_peft_model
 
-# Policy — gets new DPO LoRA adapter on top of SFT LoRA
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=BASE_MODEL,
-    max_seq_length=MAX_LEN,
-    dtype=None,
-    load_in_4bit=True,
-)
+# Merge the frozen SFT update into the base first, then attach a fresh DPO LoRA.
+# With ref_model=None, TRL disables only that fresh adapter for the reference
+# forward pass, so the actual reference policy is SFT (not the original base).
+if COMPUTE_TIER == "LOWVRAM":
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    ).to("cuda")
+else:
+    from unsloth import FastLanguageModel
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=BASE_MODEL,
+        max_seq_length=MAX_LEN,
+        dtype=None,
+        load_in_4bit=True,
+    )
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Load SFT adapter on top of base
-model = PeftModel.from_pretrained(model, str(SFT_PATH), is_trainable=True)
-print(f"Policy: {model.__class__.__name__} with SFT adapter loaded")
+model = PeftModel.from_pretrained(model, str(SFT_PATH), is_trainable=False)
+model = model.merge_and_unload(safe_merge=True)
+print(f"Reference policy: SFT adapter merged into {model.__class__.__name__}")
 
 # %%
-# Wrap policy with NEW LoRA adapter for DPO updates (don't merge SFT — keep stacked)
-# Unsloth re-applies LoRA on top of the existing PeftModel.
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.0,
-    bias="none",
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
-    use_rslora=False,
-    loftq_config=None,
-)
+target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
+if COMPUTE_TIER == "LOWVRAM":
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type="CAUSAL_LM",
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=target_modules,
+        ),
+    )
+    model.enable_input_require_grads()
+else:
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=target_modules,
+        use_gradient_checkpointing="unsloth",
+        random_state=42,
+        use_rslora=False,
+        loftq_config=None,
+    )
 print(f"Trainable params (DPO LoRA): {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 # %% [markdown]
 # > **Why no separate `ref_model=` argument?** Modern TRL (≥ 0.12) auto-detects
-# > PEFT models and uses the *base model without the adapter* as the reference.
-# > That's the same memory layout: 1 base + 2 adapter sets in VRAM. No deepcopy
-# > needed.
+# > PEFT models and disables the trainable DPO adapter for the reference pass.
+# > Here that underlying base already contains the merged SFT update, so the
+# > reference is exactly the SFT policy. No deepcopy is needed.
 
 # %% [markdown]
 # ## 2. Build DPOConfig (deck §5.2 hyperparameters)
@@ -136,11 +179,13 @@ dpo_config = DPOConfig(
     max_prompt_length=MAX_PROMPT_LEN,
     warmup_ratio=0.1,
     lr_scheduler_type="cosine",
-    logging_steps=10,
+    logging_steps=2 if COMPUTE_TIER == "LOWVRAM" else 10,
     save_strategy="no",
-    optim="adamw_8bit",
+    optim="adamw_torch" if COMPUTE_TIER == "LOWVRAM" else "adamw_8bit",
     bf16=torch.cuda.is_bf16_supported(),
     fp16=not torch.cuda.is_bf16_supported(),
+    gradient_checkpointing=COMPUTE_TIER == "LOWVRAM",
+    gradient_checkpointing_kwargs={"use_reentrant": False},
     seed=42,
     loss_type="sigmoid",         # DPO standard (alternatives: ipo, hinge, kto)
     report_to="none",
@@ -173,8 +218,11 @@ trainer = DPOTrainer(
 )
 
 # %%
+started_at = time.perf_counter()
 train_result = trainer.train()
+training_seconds = time.perf_counter() - started_at
 print(f"\nFinal DPO loss: {train_result.training_loss:.4f}")
+print(f"Training time: {training_seconds / 60:.2f} min")
 
 # %% [markdown]
 # ## 5. Plot reward curves — THE diagnostic
@@ -193,7 +241,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 logs = pd.DataFrame(trainer.state.log_history)
-logs = logs[logs["loss"].notna() if "loss" in logs.columns else logs.index].copy()
+if "loss" in logs.columns:
+    logs = logs[logs["loss"].notna()].copy()
 
 # TRL DPO logs include rewards/chosen, rewards/rejected, rewards/margins, kl
 chosen_col = "rewards/chosen" if "rewards/chosen" in logs.columns else None
@@ -237,11 +286,16 @@ plt.show()
 # Read this cell carefully — it tells you which kind of "reward gap up" you got.
 
 # %%
-if chosen_col and rejected_col and len(logs) >= 5:
-    last_chosen = logs[chosen_col].iloc[-5:].mean()
-    last_rejected = logs[rejected_col].iloc[-5:].mean()
+last_chosen = None
+last_rejected = None
+last_gap = None
+chosen_delta = None
+if chosen_col and rejected_col and len(logs) >= 1:
+    window = min(5, len(logs))
+    last_chosen = logs[chosen_col].iloc[-window:].mean()
+    last_rejected = logs[rejected_col].iloc[-window:].mean()
     last_gap = last_chosen - last_rejected
-    first_chosen = logs[chosen_col].iloc[:5].mean()
+    first_chosen = logs[chosen_col].iloc[:window].mean()
 
     chosen_delta = last_chosen - first_chosen
 
@@ -281,12 +335,22 @@ metrics = {
     "beta": BETA,
     "lr": LR,
     "epochs": EPOCHS,
+    "training_samples": len(pref_ds),
+    "max_length": MAX_LEN,
     "final_train_loss": float(train_result.training_loss),
-    "end_chosen_reward": float(last_chosen) if chosen_col else None,
-    "end_rejected_reward": float(last_rejected) if rejected_col else None,
-    "end_reward_gap": float(last_gap) if chosen_col and rejected_col else None,
+    "end_chosen_reward": float(last_chosen) if last_chosen is not None else None,
+    "end_rejected_reward": float(last_rejected) if last_rejected is not None else None,
+    "end_reward_gap": float(last_gap) if last_gap is not None else None,
+    "chosen_reward_delta": float(chosen_delta) if chosen_delta is not None else None,
+    "training_seconds": training_seconds,
+    "peak_vram_gib": torch.cuda.max_memory_allocated() / 1024**3,
 }
-(DPO_OUT / "dpo_metrics.json").write_text(json.dumps(metrics, indent=2))
+(DPO_OUT / "dpo_metrics.json").write_text(
+    json.dumps(metrics, indent=2), encoding="utf-8"
+)
+(DPO_OUT / "trainer_log_history.json").write_text(
+    json.dumps(trainer.state.log_history, indent=2), encoding="utf-8"
+)
 print(f"Wrote metrics to {DPO_OUT / 'dpo_metrics.json'}")
 
 # %% [markdown]

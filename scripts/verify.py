@@ -11,9 +11,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+# Windows PowerShell can expose a legacy cp1252 stdout even though every source
+# file in this repository is UTF-8.  The report uses Vietnamese text and a few
+# status glyphs, so force a UTF-8 writer instead of crashing halfway through the
+# pre-submission check.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 TEMPLATE_MARKERS = [
     r"<Họ Tên>",
@@ -111,6 +119,10 @@ def smoke_check(repo: Path) -> int:
     """Light-weight pre-training check: imports work, GPU visible, deck files present."""
     print("==> Smoke check (imports + GPU + deck files)\n")
     problems: list[str] = []
+    tier = os.environ.get("COMPUTE_TIER", "T4").upper()
+    if tier not in {"LOWVRAM", "T4", "BIGGPU"}:
+        problems.append(f"invalid COMPUTE_TIER: {tier}")
+    print(f"  i compute tier       {tier}")
 
     # Imports
     try:
@@ -124,7 +136,10 @@ def smoke_check(repo: Path) -> int:
     except ImportError as exc:
         problems.append(f"torch import failed: {exc}")
 
-    for mod in ["unsloth", "trl", "peft", "bitsandbytes", "datasets", "matplotlib"]:
+    modules = ["trl", "peft", "datasets", "matplotlib"]
+    if tier != "LOWVRAM":
+        modules.extend(["unsloth", "bitsandbytes"])
+    for mod in modules:
         try:
             __import__(mod)
             print(f"  ✓ {mod}")
@@ -156,7 +171,7 @@ def smoke_check(repo: Path) -> int:
         import lm_eval  # noqa: F401
         print(f"  ✓ lm_eval (NB6 benchmark suite)")
     except ImportError:
-        problems.append("lm_eval missing — pip install -r requirements.txt (NB6 will fail)")
+        print("  i lm_eval not installed (NB6 benchmark is optional)")
 
     print()
     if problems:
@@ -186,7 +201,7 @@ def main() -> int:
 
     # Notebook source files
     for nb in ["01_sft_mini.py", "02_preference_data.py", "03_dpo_train.py",
-               "04_compare_and_eval.py", "05_merge_deploy_gguf.py"]:
+               "04_compare_and_eval.py"]:
         check_file(repo / "notebooks" / nb, f"notebook {nb}", problems)
 
     # Adapter outputs

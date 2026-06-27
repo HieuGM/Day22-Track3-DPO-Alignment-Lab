@@ -23,19 +23,27 @@ import json
 from pathlib import Path
 
 COMPUTE_TIER = os.environ.get("COMPUTE_TIER", "T4").upper()
+assert COMPUTE_TIER in ("LOWVRAM", "T4", "BIGGPU"), f"Invalid COMPUTE_TIER: {COMPUTE_TIER}"
 
-if COMPUTE_TIER == "T4":
+if COMPUTE_TIER == "LOWVRAM":
+    BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    MAX_LEN = int(os.environ.get("MAX_LEN", "192"))
+    MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "128"))
+elif COMPUTE_TIER == "T4":
     BASE_MODEL = "unsloth/Qwen2.5-3B-bnb-4bit"
     MAX_LEN = 512
+    MAX_NEW_TOKENS = 256
 else:
     BASE_MODEL = "unsloth/Qwen2.5-7B-bnb-4bit"
     MAX_LEN = 1024
+    MAX_NEW_TOKENS = 256
 
 REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
 SFT_PATH = REPO_ROOT / "adapters" / "sft-mini"
 DPO_PATH = REPO_ROOT / "adapters" / "dpo"
 EVAL_OUT = REPO_ROOT / "data" / "eval"
 EVAL_OUT.mkdir(parents=True, exist_ok=True)
+REUSE_EVAL_OUTPUTS = os.environ.get("REUSE_EVAL_OUTPUTS", "0") == "1"
 
 assert SFT_PATH.exists() and DPO_PATH.exists(), "NB1 + NB3 must run first"
 
@@ -64,24 +72,48 @@ assert torch.cuda.is_available(), "Need GPU for generation"
 # ## 1. Helper — generate with a specified adapter
 
 # %%
-from unsloth import FastLanguageModel
 from peft import PeftModel
 import gc
 
 
-def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_tokens: int = 256):
-    """Load base + adapter, generate for all prompts, free memory, return outputs."""
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL,
-        max_seq_length=MAX_LEN,
-        dtype=None,
-        load_in_4bit=True,
-    )
+def generate_with_adapter(
+    adapter_path: Path, prompts: list[dict], max_new_tokens: int = MAX_NEW_TOKENS
+):
+    """Load the requested stage, generate deterministically, then release VRAM."""
+    if COMPUTE_TIER == "LOWVRAM":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+        model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        ).to("cuda")
+    else:
+        from unsloth import FastLanguageModel
+
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=BASE_MODEL,
+            max_seq_length=MAX_LEN,
+            dtype=None,
+            load_in_4bit=True,
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = PeftModel.from_pretrained(model, str(adapter_path))
-    FastLanguageModel.for_inference(model)
+    if adapter_path == DPO_PATH:
+        # NB3's DPO adapter was learned against the SFT reference. Recreate the
+        # same composition for inference: base + merged SFT + DPO delta.
+        model = PeftModel.from_pretrained(model, str(SFT_PATH))
+        model = model.merge_and_unload(safe_merge=True)
+        model = PeftModel.from_pretrained(model, str(DPO_PATH))
+    else:
+        model = PeftModel.from_pretrained(model, str(SFT_PATH))
+
+    model.config.use_cache = True
+    model.eval()
+    if COMPUTE_TIER != "LOWVRAM":
+        FastLanguageModel.for_inference(model)
 
     outputs = []
     for p in prompts:
@@ -94,7 +126,6 @@ def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_token
                 input_ids=inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,             # deterministic for fair comparison
-                temperature=1.0,
                 pad_token_id=tokenizer.eos_token_id,
             )
         generated = tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
@@ -112,16 +143,28 @@ def generate_with_adapter(adapter_path: Path, prompts: list[dict], max_new_token
 
 # %%
 print("Generating with SFT-only adapter...")
-sft_outputs = generate_with_adapter(SFT_PATH, EVAL_PROMPTS)
-print(f"Done — {len(sft_outputs)} responses")
+cached_path = EVAL_OUT / "side_by_side.jsonl"
+if REUSE_EVAL_OUTPUTS and cached_path.exists():
+    cached_rows = [
+        json.loads(line) for line in cached_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [r["id"] for r in cached_rows] == [p["id"] for p in EVAL_PROMPTS]
+    sft_outputs = [r["sft_only"] for r in cached_rows]
+    dpo_outputs = [r["sft_dpo"] for r in cached_rows]
+    print(f"Reused {len(cached_rows)} previously generated SFT/DPO pairs from {cached_path}")
+else:
+    sft_outputs = generate_with_adapter(SFT_PATH, EVAL_PROMPTS)
+    print(f"Done — {len(sft_outputs)} responses")
 
 # %% [markdown]
 # ## 3. Generate from SFT+DPO
 
 # %%
 print("Generating with SFT+DPO adapter...")
-dpo_outputs = generate_with_adapter(DPO_PATH, EVAL_PROMPTS)
-print(f"Done — {len(dpo_outputs)} responses")
+if not (REUSE_EVAL_OUTPUTS and cached_path.exists()):
+    dpo_outputs = generate_with_adapter(DPO_PATH, EVAL_PROMPTS)
+    print(f"Done — {len(dpo_outputs)} responses")
 
 # %% [markdown]
 # ## 4. Side-by-side table (deliverable: `04_side_by_side_table.png`)
@@ -282,25 +325,41 @@ def judge_with_anthropic(rows):
 
 # %%
 judge_results = None
+judge_source = None
 
 if os.environ.get("OPENAI_API_KEY"):
     print("Found OPENAI_API_KEY — running gpt-4o-mini judge")
     judge_results = judge_with_openai(rows)
+    judge_source = os.environ.get("JUDGE_MODEL", "gpt-4o-mini")
 elif os.environ.get("ANTHROPIC_API_KEY"):
     print("Found ANTHROPIC_API_KEY — running claude-haiku judge")
     judge_results = judge_with_anthropic(rows)
+    judge_source = os.environ.get("JUDGE_MODEL", "claude-haiku-4-5")
 
 if judge_results is None:
     print("No API keys set. Falling back to manual rubric mode.")
-    print("Fill in your manual judgments below — same JSON shape:")
-    print('  {"id": 1, "winner": "A" | "B" | "tie", "justification": "<...>"}')
-    judge_results = [
-        {"id": p["id"], "category": p["category"], "winner": "tie", "justification": "MANUAL — fill in"}
-        for p in EVAL_PROMPTS
-    ]
+    manual_path = EVAL_OUT / "manual_judgments.json"
+    if manual_path.exists():
+        judge_results = json.loads(manual_path.read_text(encoding="utf-8"))
+        assert len(judge_results) == len(EVAL_PROMPTS), "Manual rubric must cover all 8 prompts"
+        assert {r["id"] for r in judge_results} == {p["id"] for p in EVAL_PROMPTS}
+        assert all(r["winner"] in {"A", "B", "tie"} for r in judge_results)
+        print(f"Loaded {len(judge_results)} completed verdicts from {manual_path}")
+    else:
+        print(f"Complete {manual_path} and rerun NB4.")
+        judge_results = [
+            {
+                "id": p["id"],
+                "category": p["category"],
+                "winner": "tie",
+                "justification": "MANUAL - pending review",
+            }
+            for p in EVAL_PROMPTS
+        ]
+    judge_source = "manual rubric"
 
 (EVAL_OUT / "judge_results.json").write_text(
-    json.dumps(judge_results, ensure_ascii=False, indent=2)
+    json.dumps(judge_results, ensure_ascii=False, indent=2), encoding="utf-8"
 )
 
 # %% [markdown]
@@ -328,6 +387,96 @@ print("=" * 60)
 summary(counter_all, "Overall:", len(judge_results))
 summary(counter_help, "Helpfulness:", 4)
 summary(counter_safe, "Safety:", 4)
+
+# Overwrite the preliminary comparison image with the final verdict column.
+# Wrapping keeps every row readable in a single submission screenshot.
+verdict_by_id = {r["id"]: r["winner"] for r in judge_results}
+final_table_data = [["#", "Category", "Prompt", "SFT-only", "SFT+DPO", "Winner"]]
+for r in rows:
+    final_table_data.append([
+        r["id"],
+        r["category"],
+        textwrap.fill(r["prompt"], 32),
+        textwrap.fill(r["SFT-only"], 48),
+        textwrap.fill(r["SFT+DPO"], 48),
+        verdict_by_id[r["id"]],
+    ])
+
+fig, ax = plt.subplots(figsize=(16, 10))
+ax.axis("off")
+table = ax.table(
+    cellText=final_table_data,
+    loc="center",
+    cellLoc="left",
+    colWidths=[0.035, 0.085, 0.19, 0.30, 0.30, 0.07],
+)
+table.auto_set_font_size(False)
+table.set_fontsize(8)
+table.scale(1.0, 3.6)
+for j in range(len(final_table_data[0])):
+    table[(0, j)].set_facecolor("#2e548a")
+    table[(0, j)].set_text_props(color="white", weight="bold")
+for i in range(1, len(final_table_data)):
+    if final_table_data[i][1] == "safety":
+        table[(i, 1)].set_facecolor("#fce4e4")
+fig.suptitle(
+    "SFT-only vs SFT+DPO - 8 Vietnamese prompts with verdicts",
+    fontsize=13,
+    fontweight="bold",
+)
+fig.tight_layout()
+fig.savefig(screenshot_dir / "04-side-by-side-table.png", dpi=140, bbox_inches="tight")
+plt.show()
+
+# Render the complete manual/API rubric as submission evidence.
+judge_table = [["#", "Category", "Winner", "Justification"]]
+for result in judge_results:
+    judge_table.append([
+        result["id"],
+        result["category"],
+        result["winner"],
+        textwrap.fill(result["justification"], 62),
+    ])
+
+fig, ax = plt.subplots(figsize=(13, 0.85 * len(judge_table) + 1.2))
+ax.axis("off")
+table = ax.table(
+    cellText=judge_table,
+    loc="center",
+    cellLoc="left",
+    colWidths=[0.05, 0.12, 0.09, 0.74],
+)
+table.auto_set_font_size(False)
+table.set_fontsize(8.5)
+table.scale(1.0, 1.65)
+for j in range(len(judge_table[0])):
+    table[(0, j)].set_facecolor("#2e548a")
+    table[(0, j)].set_text_props(color="white", weight="bold")
+fig.suptitle(f"NB4 verdicts - {judge_source}", fontsize=12, fontweight="bold")
+fig.tight_layout()
+fig.savefig(screenshot_dir / "05-manual-rubric.png", dpi=140, bbox_inches="tight")
+plt.show()
+
+# Token lengths are useful for the reflection's verbosity comparison.
+from transformers import AutoTokenizer
+
+eval_tokenizer = AutoTokenizer.from_pretrained(SFT_PATH)
+sft_lengths = [len(eval_tokenizer(text).input_ids) for text in sft_outputs]
+dpo_lengths = [len(eval_tokenizer(text).input_ids) for text in dpo_outputs]
+eval_metrics = {
+    "compute_tier": COMPUTE_TIER,
+    "base_model": BASE_MODEL,
+    "judge": judge_source,
+    "sft_wins": counter_all.get("A", 0),
+    "dpo_wins": counter_all.get("B", 0),
+    "ties": counter_all.get("tie", 0),
+    "mean_sft_output_tokens": sum(sft_lengths) / len(sft_lengths),
+    "mean_dpo_output_tokens": sum(dpo_lengths) / len(dpo_lengths),
+}
+(EVAL_OUT / "eval_metrics.json").write_text(
+    json.dumps(eval_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print(f"Saved eval metrics to {EVAL_OUT / 'eval_metrics.json'}")
 
 # %% [markdown]
 # ## 7. Vibe-coding callout

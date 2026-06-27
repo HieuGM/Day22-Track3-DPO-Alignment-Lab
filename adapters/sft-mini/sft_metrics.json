@@ -1,0 +1,11 @@
+{
+  "compute_tier": "LOWVRAM",
+  "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dataset": "tsdocode/vi_alpaca_clean",
+  "samples": 128,
+  "epochs": 1,
+  "max_length": 192,
+  "final_train_loss": 1.8916371166706085,
+  "training_seconds": 164.06871829999727,
+  "peak_vram_gib": 1.674623966217041
+}

@@ -1,0 +1,10 @@
+{
+  "compute_tier": "LOWVRAM",
+  "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "judge": "manual rubric",
+  "sft_wins": 1,
+  "dpo_wins": 0,
+  "ties": 7,
+  "mean_sft_output_tokens": 79.625,
+  "mean_dpo_output_tokens": 82.125
+}

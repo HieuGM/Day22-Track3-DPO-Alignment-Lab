@@ -29,8 +29,12 @@ def main():
             "PREF_DATASET", "argilla/ultrafeedback-binarized-preferences-cleaned"
         ),
     )
-    parser.add_argument("--slice", type=int, default=None,
-                        help="Number of pairs (default: 2000 for T4, 5000 for BIGGPU)")
+    parser.add_argument(
+        "--slice",
+        type=int,
+        default=None,
+        help="Number of pairs (default: 128 LOWVRAM, 1000 T4, 5000 BIGGPU)",
+    )
     parser.add_argument("--output", default=str(REPO / "data" / "pref"),
                         help="Output directory")
     parser.add_argument("--tokenizer", default=str(REPO / "adapters" / "sft-mini"),
@@ -38,7 +42,9 @@ def main():
     args = parser.parse_args()
 
     tier = os.environ.get("COMPUTE_TIER", "T4").upper()
-    pref_slice = args.slice or (2000 if tier == "T4" else 5000)
+    assert tier in {"LOWVRAM", "T4", "BIGGPU"}, f"Invalid COMPUTE_TIER: {tier}"
+    default_slices = {"LOWVRAM": 128, "T4": 1000, "BIGGPU": 5000}
+    pref_slice = args.slice or default_slices[tier]
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)

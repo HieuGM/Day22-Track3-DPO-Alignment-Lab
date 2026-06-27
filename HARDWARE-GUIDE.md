@@ -26,6 +26,7 @@ DPO = policy (trainable) + reference (frozen) + activations + KV cache + optimiz
 | Colab Pro L4 (22.5 GB) | **BigGPU** | `colab/Lab22_DPO_BigGPU.ipynb` |
 | Colab Pro A100 (40 GB) | **BigGPU** | `colab/Lab22_DPO_BigGPU.ipynb` |
 | Laptop RTX 3060/4060 (≥ 12 GB) | T4 | `setup-laptop.sh` + `make pipeline` |
+| Laptop NVIDIA 6–8 GB (native Windows) | **LOWVRAM** | `requirements-lowvram.txt` + `COMPUTE_TIER=LOWVRAM` |
 | Laptop RTX 3090/4090 (24 GB) | BigGPU | `setup-laptop.sh` + `COMPUTE_TIER=BIGGPU make pipeline` |
 | Cloud H100 / 8×A100 | BigGPU + bonus | `requirements-biggpu.txt` + try `Qwen2.5-14B` |
 | **No GPU** | — | DPO needs GPU. Use a free Colab T4. CPU DPO would take ~24 hours per epoch. |
@@ -37,8 +38,23 @@ Do you have a usable NVIDIA GPU?
 ├─ No → Free Colab T4 (Runtime → Change runtime type → T4 GPU). Default.
 ├─ Yes, ≥ 24 GB VRAM (3090/4090/A100/L4)
 │   └─ COMPUTE_TIER=BIGGPU → Qwen2.5-7B faithful path, deck-aligned numbers
-└─ Yes, 12-23 GB VRAM (3060/3070/4060/3080)
-    └─ COMPUTE_TIER=T4 → Qwen2.5-3B, runs comfortably with margin
+├─ Yes, 12-23 GB VRAM (3060/3070/4060/3080)
+│   └─ COMPUTE_TIER=T4 → Qwen2.5-3B, runs comfortably with margin
+└─ Yes, 6-8 GB VRAM
+    └─ COMPUTE_TIER=LOWVRAM → Qwen2.5-0.5B fp16, reduced slices/sequence length
+```
+
+`LOWVRAM` is a constrained but genuine training run, not a simulated result.
+Report the smaller model and slices explicitly in `submission/REFLECTION.md`;
+use T4 Colab if you need the course-default 3B numbers.
+
+Native Windows setup (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install -r requirements-lowvram.txt
+$env:COMPUTE_TIER = "LOWVRAM"
 ```
 
 If `make smoke` OOMs on your tier, the next move is:

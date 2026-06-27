@@ -1,0 +1,16 @@
+{
+  "compute_tier": "LOWVRAM",
+  "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "beta": 0.1,
+  "lr": 5e-06,
+  "epochs": 2,
+  "training_samples": 128,
+  "max_length": 192,
+  "final_train_loss": 0.6713323593139648,
+  "end_chosen_reward": 0.13107176423072814,
+  "end_rejected_reward": 0.030374060710892083,
+  "end_reward_gap": 0.10069770351983606,
+  "chosen_reward_delta": 0.128401156142354,
+  "training_seconds": 729.0419324000104,
+  "peak_vram_gib": 2.024742603302002
+}
